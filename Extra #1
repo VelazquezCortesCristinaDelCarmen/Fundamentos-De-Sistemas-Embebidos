@@ -1,0 +1,98 @@
+import math
+import ustruct
+from machine import Pin, Timer
+from utime import sleep_us
+from i2cslave import I2CSlave
+
+SLAVE_ADDR = 0x0A
+ZX_PIN = 2
+TRIAC_PIN = 3
+BOARD_LED = 25
+
+power = 0.0
+pdelay = 8203
+trigger_timer = Timer()
+
+triac_pin = Pin(TRIAC_PIN, Pin.OUT)
+triac_pin.value(0)
+
+ANCHORS = [
+    (0,   8203),
+    (10,  6180),
+    (20,  5500),
+    (30,  4990),
+    (40,  4530),
+    (50,  4170),
+    (60,  3650),
+    (70,  3150),
+    (80,  2500),
+    (90,  1500),
+    (100,  200)
+]
+
+def obtener_pdelay_por_lut(p):
+    p = max(0.0, min(100.0, p))
+    if p >= 100.0:
+        return 200
+    if p <= 0.0:
+        return 8203
+        
+    for i in range(len(ANCHORS) - 1):
+        p1, d1 = ANCHORS[i]
+        p2, d2 = ANCHORS[i+1]
+        if p1 <= p <= p2:
+            return int(d1 + (p - p1) * (d2 - d1) / (p2 - p1))
+    return 8203
+
+def calcular_potencia_real(pdelay_us):
+    if pdelay_us >= 8200:
+        return 0.0
+    elif pdelay_us <= 200:
+        return 100.0
+
+    alpha = (pdelay_us / 8333.33) * math.pi
+    p_real = (1.0 - (alpha / math.pi) + (math.sin(2.0 * alpha) / (2.0 * math.pi))) * 100.0
+    return max(0.0, min(100.0, p_real))
+
+def enviar_pulso_triac(timer):
+    triac_pin.value(1)
+    sleep_us(30)
+    triac_pin.value(0)
+
+def zx_handle(pin):
+    global pdelay
+    triac_pin.value(0)
+    
+    if pdelay < 8200:
+        delay_ms = pdelay / 1000.0
+        trigger_timer.init(mode=Timer.ONE_SHOT, period=max(1, int(delay_ms)), callback=enviar_pulso_triac)
+    else:
+        trigger_timer.deinit()
+
+zx_pin = Pin(ZX_PIN, Pin.IN, Pin.PULL_UP)
+zx_pin.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=zx_handle)
+
+i2c = I2CSlave(id=0, address=SLAVE_ADDR, sda=20, scl=21)
+
+print("Control de brillo calibrado para potencia real listo")
+
+while True:
+    try:
+        if i2c.rxBufferCount() >= 4:
+            data = i2c.read()
+            if len(data) == 4:
+                power_in = ustruct.unpack('<f', data)[0]
+                power_in = max(0.0, min(100.0, power_in))
+                
+                pdelay = obtener_pdelay_por_lut(power_in)
+                potencia_real = calcular_potencia_real(pdelay)
+                potencia_reportada = round(potencia_real, 1)
+                
+                respuesta = ustruct.pack('<f', potencia_reportada)
+                i2c.write(respuesta)
+                
+                print(f"I2C: Solicitado={power_in:.1f}% | Retardo={pdelay}us | Reportado={potencia_reportada:.1f}%")
+        else:
+            sleep_us(10)
+    except Exception as e:
+        print("Error I2C:", e)
